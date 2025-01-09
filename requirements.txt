@@ -1,0 +1,6 @@
+fastapi
+uvicorn
+requests
+websockets
+uvicorn[standard]
+isodate
