@@ -64,7 +64,7 @@ def parse_duration(duration_iso):
     """Convierte una duración en formato ISO 8601 en segundos."""
     return isodate.parse_duration(duration_iso).total_seconds()
 
-def fetch_playlist_items_with_embeddable(playlist_id: str) -> List[Song]:
+def fetch_playlist_items(playlist_id: str) -> List[Song]:
     base_url = "https://www.googleapis.com/youtube/v3/playlistItems"
     video_base_url = "https://www.googleapis.com/youtube/v3/videos"
     params = {
