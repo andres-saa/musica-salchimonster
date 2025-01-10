@@ -64,7 +64,7 @@ def parse_duration(duration_iso):
     """Convierte una duración en formato ISO 8601 en segundos."""
     return isodate.parse_duration(duration_iso).total_seconds()
 
-def fetch_playlist_items(playlist_id: str) -> List[Song]:
+def fetch_playlist_items_with_embeddable(playlist_id: str) -> List[Song]:
     base_url = "https://www.googleapis.com/youtube/v3/playlistItems"
     video_base_url = "https://www.googleapis.com/youtube/v3/videos"
     params = {
@@ -73,30 +73,46 @@ def fetch_playlist_items(playlist_id: str) -> List[Song]:
         "maxResults": 50,
         "key": YT_API_KEY
     }
-    video_params = {
-        "part": "contentDetails",
-        "key": YT_API_KEY
-    }
     resp = requests.get(base_url, params=params)
     resp.raise_for_status()
-    data = resp.json()
-    items = data.get("items", [])
-    results = []
+    items = resp.json().get("items", [])
+    
+    # Obtener los IDs de video
     video_ids = [item["snippet"]["resourceId"]["videoId"] for item in items]
-    video_params["id"] = ",".join(video_ids)
+    
+    # Agrupar videos en una sola consulta
+    video_params = {
+        "part": "contentDetails,status",
+        "id": ",".join(video_ids),
+        "key": YT_API_KEY
+    }
     video_resp = requests.get(video_base_url, params=video_params)
     video_resp.raise_for_status()
     video_data = video_resp.json()
-    duration_dict = {video['id']: parse_duration(video['contentDetails']['duration']) for video in video_data.get("items", [])}
-
+    
+    # Crear listas de duración y embeddable
+    duration_dict = {
+        video['id']: parse_duration(video['contentDetails']['duration'])
+        for video in video_data.get("items", [])
+    }
+    embeddable_dict = {
+        video['id']: video['status'].get('embeddable', False)
+        for video in video_data.get("items", [])
+    }
+    
+    # Construir resultados
+    results = []
     for item in items:
         snippet = item["snippet"]
         video_id = snippet["resourceId"]["videoId"]
         title = snippet["title"]
         thumbnail = snippet.get("thumbnails", {}).get("high", {}).get("url", "")
-        duration = duration_dict.get(video_id, 0)  # Obtener la duración en segundos
-        if (duration != 0):
+        duration = duration_dict.get(video_id, 0)
+        is_embeddable = embeddable_dict.get(video_id, False)
+
+        if duration > 0 and is_embeddable:
             results.append(Song(id=video_id, title=title, thumbnail=thumbnail, duration=duration))
+    
     return results
 
 @app.on_event("startup")
