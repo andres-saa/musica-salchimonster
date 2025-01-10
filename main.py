@@ -176,7 +176,7 @@ async def broadcast_queue():
 async def playback_updater():
     global currentTime, isPlaying, currentIndex, totalDuration  # Declaración global correcta
     while True:
-        await asyncio.sleep(1)
+        await asyncio.sleep(10)
         async with playback_lock:
             if isPlaying and 0 <= currentIndex < len(videoQueue):
                 currentTime += 1.0
