@@ -47,7 +47,7 @@ isPlaying: bool = False
 playback_lock = asyncio.Lock()
 
 YT_API_KEY = "AIzaSyD1D4di1V3GaXtM5EL-4LGldvvz-fH0bPI"
-PLAYLIST_LINK = "https://www.youtube.com/watch?v=PnpEOtzb668&list=PL-gZXqgFkoU9BkxbRNZPgtUSQu4Air11I"
+PLAYLIST_LINK = "https://youtube.com/playlist?list=PLzeOgQjW3-PsxvQS-DGut16T-dpVK2Hf5&si=c8vOGdVME92ciMC3"
 
 def get_playlist_id_from_url(url: str) -> Optional[str]:
     try:
