@@ -90,7 +90,7 @@ def fetch_playlist_items(playlist_id: str) -> List[Song]:
     video_resp.raise_for_status()
     video_data = video_resp.json()
     
-    # Crear listas de duración y embeddable
+    # Crear listas de duración, embeddable y contentRating
     duration_dict = {
         video['id']: parse_duration(video['contentDetails']['duration'])
         for video in video_data.get("items", [])
@@ -99,8 +99,12 @@ def fetch_playlist_items(playlist_id: str) -> List[Song]:
         video['id']: video['status'].get('embeddable', False)
         for video in video_data.get("items", [])
     }
+    content_rating_dict = {
+        video['id']: video['contentDetails'].get('contentRating', {})
+        for video in video_data.get("items", [])
+    }
     
-    # Construir resultados
+    # Construir resultados excluyendo videos con contentRating
     results = []
     for item in items:
         snippet = item["snippet"]
@@ -109,11 +113,14 @@ def fetch_playlist_items(playlist_id: str) -> List[Song]:
         thumbnail = snippet.get("thumbnails", {}).get("high", {}).get("url", "")
         duration = duration_dict.get(video_id, 0)
         is_embeddable = embeddable_dict.get(video_id, False)
-
-        if duration > 0 and is_embeddable:
+        content_rating = content_rating_dict.get(video_id, {})
+        
+        # Excluir videos que tienen contentRating (restricciones de contenido)
+        if duration > 0 and is_embeddable and not content_rating:
             results.append(Song(id=video_id, title=title, thumbnail=thumbnail, duration=duration))
     
     return results
+
 
 @app.on_event("startup")
 async def load_available_songs():
