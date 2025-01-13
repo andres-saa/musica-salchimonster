@@ -118,6 +118,8 @@ def fetch_playlist_items(playlist_id: str) -> List[Song]:
         # Excluir videos que tienen contentRating (restricciones de contenido)
         if duration > 0 and is_embeddable and not content_rating:
             results.append(Song(id=video_id, title=title, thumbnail=thumbnail, duration=duration))
+        else:
+            print(f"Excluyendo video por restricciones: {title} (ID: {video_id})")
     
     return results
 
