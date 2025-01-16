@@ -1,5 +1,5 @@
 import random
-from typing import List, Optional
+from typing import List, Optional, Dict
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
@@ -10,9 +10,9 @@ import asyncio
 import isodate
 
 app = FastAPI(
-    title="Salchimonster Backend",
-    description="API con biblioteca y cola separadas + WebSockets para sincronización en tiempo real",
-    version="0.2.0",
+    title="Salchimonster Backend (Multi-Sede)",
+    description="API con biblioteca única y múltiples colas (una por sede) + WebSockets para sincronización en tiempo real",
+    version="0.3.0",
 )
 
 app.add_middleware(
@@ -37,13 +37,26 @@ class PlaybackStatus(BaseModel):
     isPlaying: bool
     currentSong: Optional[Song] = None
 
+# Biblioteca global (compartida entre todas las sedes)
 availableSongs: List[Song] = []
-videoQueue: List[Song] = []
-currentIndex: int = 0
-currentTime: float = 0.0
-totalDuration: float = 0.0
-isPlaying: bool = False
 
+# Diccionario que guarda el estado de cada sede
+# Estructura:
+# sede_data = {
+#   "sede1": {
+#       "queue": [],
+#       "currentIndex": 0,
+#       "currentTime": 0.0,
+#       "totalDuration": 0.0,
+#       "isPlaying": False
+#   },
+#   "sede2": {
+#       ...
+#   }
+# }
+sede_data: Dict[str, Dict] = {}
+
+# Lock global para no solapar la actualización de reproducción
 playback_lock = asyncio.Lock()
 
 # Reemplaza con tu propia clave de API de YouTube
@@ -142,7 +155,7 @@ def fetch_playlist_items(playlist_id: str) -> List[Song]:
             duration > 0 
             and is_embeddable 
             and not content_rating
-            and not blocked_regions  # Excluir si hay regiones bloqueadas
+            and not blocked_regions
         ):
             results.append(
                 Song(
@@ -175,6 +188,10 @@ async def load_available_songs():
     except Exception as e:
         print("Error cargando la playlist:", e)
 
+#########################
+# Manejo de Conexiones  #
+#########################
+
 class ConnectionManager:
     def __init__(self):
         self.active_connections: List[WebSocket] = []
@@ -200,129 +217,135 @@ class ConnectionManager:
                 except Exception as e:
                     print(f"Error enviando mensaje: {e}")
 
-manager = ConnectionManager()
+# Un diccionario de managers, uno por sede
+managers: Dict[str, ConnectionManager] = {}
 
-@app.websocket("/ws")
-async def websocket_endpoint(websocket: WebSocket):
+def get_manager_for_sede(sede_id: str) -> ConnectionManager:
     """
-    Maneja las conexiones WebSocket para enviar/recibir actualizaciones en tiempo real
-    de la cola de reproducción.
+    Devuelve (o crea) el ConnectionManager correspondiente a la sede dada.
     """
-    await manager.connect(websocket)
-    try:
-        # Al conectar, envía el estado inicial de la cola
-        await websocket.send_text(get_queue_status_json())
+    if sede_id not in managers:
+        managers[sede_id] = ConnectionManager()
+    return managers[sede_id]
 
-        while True:
-            data = await websocket.receive_text()
-            await handle_message(data, websocket)
-    except WebSocketDisconnect:
-        await manager.disconnect(websocket)
-    except Exception as e:
-        print(f"Error en WebSocket: {e}")
-        await manager.disconnect(websocket)
+#####################
+# Funciones Helpers #
+#####################
 
-def get_queue_status_json() -> str:
+def get_sede_data(sede_id: str) -> Dict:
     """
-    Construye y devuelve un JSON con el estado de la cola y la canción actual.
+    Devuelve (o inicializa) la estructura de datos de la sede indicada.
     """
-    current_song = None
-    if 0 <= currentIndex < len(videoQueue):
-        current_song = videoQueue[currentIndex]
+    if sede_id not in sede_data:
+        sede_data[sede_id] = {
+            "queue": [],
+            "currentIndex": 0,
+            "currentTime": 0.0,
+            "totalDuration": 0.0,
+            "isPlaying": False
+        }
+    return sede_data[sede_id]
+
+def get_queue_status_json(sede_id: str) -> str:
+    """
+    Construye y devuelve un JSON con el estado de la cola y la canción actual para la sede dada.
+    """
+    data = get_sede_data(sede_id)
+    queue = data["queue"]
+    current_index = data["currentIndex"]
+    current_song = queue[current_index] if 0 <= current_index < len(queue) else None
+
     status = PlaybackStatus(
-        currentIndex=currentIndex,
-        currentTime=currentTime,
-        totalDuration=totalDuration,
-        isPlaying=isPlaying,
+        currentIndex=current_index,
+        currentTime=data["currentTime"],
+        totalDuration=data["totalDuration"],
+        isPlaying=data["isPlaying"],
         currentSong=current_song
     )
+
     return json.dumps({
         "type": "queue_update",
-        "queue": [song.dict() for song in videoQueue],
+        "queue": [song.dict() for song in queue],
         "status": status.dict(),
     })
 
-async def broadcast_queue():
+async def broadcast_queue(sede_id: str):
     """
-    Envía a todos los clientes la actualización de la cola en formato JSON.
+    Envía a todos los clientes (de la sede dada) la actualización de la cola en formato JSON.
     """
-    await manager.broadcast(get_queue_status_json())
+    manager = get_manager_for_sede(sede_id)
+    await manager.broadcast(get_queue_status_json(sede_id))
 
-async def playback_updater():
+async def next_song_internal(sede_id: str):
     """
-    Tarea asíncrona que cada segundo actualiza el tiempo de reproducción
-    y, si la canción termina, avanza a la siguiente.
+    Avanza a la siguiente canción de la cola de la sede indicada. 
+    Si no hay más, elige una canción aleatoria de la biblioteca y la agrega. 
+    Si no hay canciones en la biblioteca, detiene la reproducción.
     """
-    global currentTime, isPlaying, currentIndex, totalDuration
-    while True:
-        await asyncio.sleep(1)
-        async with playback_lock:
-            if isPlaying and 0 <= currentIndex < len(videoQueue):
-                currentTime += 1.0
-                if currentTime >= totalDuration and totalDuration > 0:
-                    await next_song_internal()
-                else:
-                    await broadcast_queue()
-
-async def next_song_internal():
-    """
-    Avanza a la siguiente canción de la cola. Si no hay más, elige una
-    canción aleatoria de la biblioteca y la agrega. Si no hay canciones en
-    la biblioteca, detiene la reproducción.
-    """
-    global currentIndex, currentTime, isPlaying, videoQueue, totalDuration, availableSongs
+    data = get_sede_data(sede_id)
+    queue = data["queue"]
+    current_index = data["currentIndex"]
+    current_time = data["currentTime"]
+    total_duration = data["totalDuration"]
+    is_playing = data["isPlaying"]
 
     # Si no hemos llegado al final de la cola, simplemente avanzamos
-    if currentIndex < len(videoQueue) - 1:
-        currentIndex += 1
-        currentTime = 0.0
-        totalDuration = videoQueue[currentIndex].duration
-        isPlaying = True
+    if current_index < len(queue) - 1:
+        data["currentIndex"] = current_index + 1
+        data["currentTime"] = 0.0
+        data["totalDuration"] = queue[data["currentIndex"]].duration
+        data["isPlaying"] = True
     else:
         # Hemos llegado al final de la cola. Tomamos una canción de la biblioteca
         # al azar y la ponemos en la cola (si hay disponibles).
         if availableSongs:
             chosen = random.choice(availableSongs)
             # Opcional: evitar repetir la misma canción si hay más de una disponible
-            while len(availableSongs) > 1 and chosen.id == (videoQueue[currentIndex].id if videoQueue else None):
+            while len(availableSongs) > 1 and chosen.id == (queue[current_index].id if queue else None):
                 chosen = random.choice(availableSongs)
 
             # Agrega la canción seleccionada al final de la cola
-            videoQueue.append(
+            queue.append(
                 Song(**chosen.dict(exclude={"requestedBy"}), requestedBy="Salchimonster")
             )
-            currentIndex = len(videoQueue) - 1
-            currentTime = 0.0
-            totalDuration = chosen.duration
-            isPlaying = True
+            data["currentIndex"] = len(queue) - 1
+            data["currentTime"] = 0.0
+            data["totalDuration"] = chosen.duration
+            data["isPlaying"] = True
         else:
             # No hay canciones disponibles
-            isPlaying = False
-            totalDuration = 0.0
+            data["isPlaying"] = False
+            data["totalDuration"] = 0.0
 
-    await broadcast_queue()
+    await broadcast_queue(sede_id)
 
-async def handle_message(message: str, websocket: WebSocket):
+async def handle_message(message: str, websocket: WebSocket, sede_id: str):
     """
-    Procesa los mensajes recibidos a través del WebSocket.
+    Procesa los mensajes recibidos a través del WebSocket (para la sede dada).
     """
-    global videoQueue, currentIndex, currentTime, isPlaying, totalDuration
+    data = get_sede_data(sede_id)
+    queue = data["queue"]
+    current_index = data["currentIndex"]
+
+    global playback_lock
+
     try:
-        data = json.loads(message)
-        msg_type = data.get("type")
+        parsed = json.loads(message)
+        msg_type = parsed.get("type")
         
         if msg_type == "update_time":
-            time_val = data.get("time")
+            time_val = parsed.get("time")
             if isinstance(time_val, (int, float)):
                 async with playback_lock:
-                    currentTime = float(time_val)
-                    if currentTime >= totalDuration and totalDuration > 0:
-                        await next_song_internal()
-                await broadcast_queue()
+                    data["currentTime"] = float(time_val)
+                    # Verificar si ya se acabó la canción
+                    if data["currentTime"] >= data["totalDuration"] and data["totalDuration"] > 0:
+                        await next_song_internal(sede_id)
+                await broadcast_queue(sede_id)
 
         elif msg_type == "add_song":
-            song_id = data.get("song_id")
-            requested_by = data.get("requestedBy", "Sistema")
+            song_id = parsed.get("song_id")
+            requested_by = parsed.get("requestedBy", "Sistema")
             if song_id:
                 async with playback_lock:
                     found = next((s for s in availableSongs if s.id == song_id), None)
@@ -331,22 +354,23 @@ async def handle_message(message: str, websocket: WebSocket):
                         song_data = found.dict()
                         song_data["requestedBy"] = requested_by
                         new_song = Song(**song_data)
-                        videoQueue.append(new_song)
 
+                        queue.append(new_song)
                         # Si la cola estaba vacía, iniciamos reproducción
-                        if len(videoQueue) == 1:
-                            currentIndex = 0
-                            currentTime = 0.0
-                            isPlaying = True
-                            totalDuration = new_song.duration
+                        if len(queue) == 1:
+                            data["currentIndex"] = 0
+                            data["currentTime"] = 0.0
+                            data["isPlaying"] = True
+                            data["totalDuration"] = new_song.duration
 
-                        await broadcast_queue()
+                        await broadcast_queue(sede_id)
                     else:
                         # Si no se encontró la canción en la biblioteca
                         await websocket.send_text(json.dumps({
                             "type": "error",
                             "message": "Canción no encontrada"
                         }))
+                # end with lock
             else:
                 print("song_id no proporcionado en 'add_song'")
 
@@ -358,56 +382,51 @@ async def handle_message(message: str, websocket: WebSocket):
     except Exception as e:
         print(f"Error general en WebSocket: {e}")
 
-@app.get("/available", response_model=List[Song])
-async def get_available_songs():
-    """
-    Retorna la lista de canciones disponibles (biblioteca).
-    """
-    return availableSongs
+####################
+# Endpoint WebSocket
+####################
 
-@app.get("/queue", response_model=List[Song])
-async def get_queue():
+@app.websocket("/ws/{sede_id}")
+async def websocket_endpoint(websocket: WebSocket, sede_id: str):
     """
-    Retorna la cola de reproducción actual.
+    Maneja las conexiones WebSocket para enviar/recibir actualizaciones en tiempo real
+    de la cola de reproducción de la sede especificada.
     """
-    return videoQueue
+    manager = get_manager_for_sede(sede_id)
+    await manager.connect(websocket)
+    try:
+        # Al conectar, envía el estado inicial de la cola
+        await websocket.send_text(get_queue_status_json(sede_id))
 
-@app.get("/current", response_model=PlaybackStatus)
-async def get_current_status():
-    """
-    Retorna el estado actual de la reproducción (canción, tiempo, etc.).
-    Si la cola está vacía, se intenta avanzar a la siguiente canción para
-    asegurar que siempre haya algo en reproducción si es posible.
-    """
-    global currentIndex, currentTime, totalDuration, isPlaying, videoQueue
+        while True:
+            data = await websocket.receive_text()
+            await handle_message(data, websocket, sede_id)
+    except WebSocketDisconnect:
+        await manager.disconnect(websocket)
+    except Exception as e:
+        print(f"Error en WebSocket: {e}")
+        await manager.disconnect(websocket)
 
-    # Si la cola está vacía, intenta generar la siguiente canción
-    if not videoQueue:
+###################
+# Tarea de playback
+###################
+
+async def playback_updater():
+    """
+    Tarea asíncrona global que cada segundo actualiza el tiempo de reproducción 
+    de TODAS las sedes y, si la canción termina, avanza a la siguiente en cada sede.
+    """
+    while True:
+        await asyncio.sleep(1)
         async with playback_lock:
-            if not videoQueue:
-                await next_song_internal()
-
-    current_song = None
-    if 0 <= currentIndex < len(videoQueue):
-        current_song = videoQueue[currentIndex]
-
-    status = PlaybackStatus(
-        currentIndex=currentIndex,
-        currentTime=currentTime,
-        totalDuration=totalDuration,
-        isPlaying=isPlaying,
-        currentSong=current_song
-    )
-    return status
-
-@app.post("/next", response_model=PlaybackStatus)
-async def next_song():
-    """
-    Avanza manualmente a la siguiente canción de la cola.
-    """
-    async with playback_lock:
-        await next_song_internal()
-    return await get_current_status()
+            for sid, data in sede_data.items():
+                if data["isPlaying"] and 0 <= data["currentIndex"] < len(data["queue"]):
+                    data["currentTime"] += 1.0
+                    if data["currentTime"] >= data["totalDuration"] and data["totalDuration"] > 0:
+                        await next_song_internal(sid)
+                    else:
+                        # Notificamos a los clientes de la sede el cambio de tiempo
+                        await broadcast_queue(sid)
 
 @app.on_event("startup")
 async def start_playback_updater():
@@ -415,3 +434,60 @@ async def start_playback_updater():
     Inicia la tarea asíncrona para actualizar el tiempo de reproducción.
     """
     asyncio.create_task(playback_updater())
+
+###############
+# Endpoints REST
+###############
+
+@app.get("/available", response_model=List[Song])
+async def get_available_songs_handler():
+    """
+    Retorna la lista de canciones disponibles (biblioteca global).
+    """
+    return availableSongs
+
+@app.get("/queue/{sede_id}", response_model=List[Song])
+async def get_queue(sede_id: str):
+    """
+    Retorna la cola de reproducción actual de la sede dada.
+    """
+    data = get_sede_data(sede_id)
+    return data["queue"]
+
+@app.get("/current/{sede_id}", response_model=PlaybackStatus)
+async def get_current_status(sede_id: str):
+    """
+    Retorna el estado actual de la reproducción (canción, tiempo, etc.) de la sede dada.
+    Si la cola está vacía, se intenta avanzar a la siguiente canción 
+    (para asegurar que siempre haya algo en reproducción si es posible).
+    """
+    data = get_sede_data(sede_id)
+
+    # Si la cola está vacía, intenta generar la siguiente canción
+    if not data["queue"]:
+        async with playback_lock:
+            if not data["queue"]:
+                await next_song_internal(sede_id)
+
+    # Cargar el estado
+    current_song = None
+    if 0 <= data["currentIndex"] < len(data["queue"]):
+        current_song = data["queue"][data["currentIndex"]]
+
+    status = PlaybackStatus(
+        currentIndex=data["currentIndex"],
+        currentTime=data["currentTime"],
+        totalDuration=data["totalDuration"],
+        isPlaying=data["isPlaying"],
+        currentSong=current_song
+    )
+    return status
+
+@app.post("/next/{sede_id}", response_model=PlaybackStatus)
+async def next_song(sede_id: str):
+    """
+    Avanza manualmente a la siguiente canción de la cola de la sede dada.
+    """
+    async with playback_lock:
+        await next_song_internal(sede_id)
+    return await get_current_status(sede_id)
