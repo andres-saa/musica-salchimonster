@@ -4,3 +4,7 @@ requests
 websockets
 uvicorn[standard]
 isodate
+python-dotenv
+google-auth
+google-auth-oauthlib
+google-auth-httplib2
