@@ -491,3 +491,23 @@ async def next_song(sede_id: str):
     async with playback_lock:
         await next_song_internal(sede_id)
     return await get_current_status(sede_id)
+
+
+
+
+
+@app.post("/refresh-playlist", response_model=Dict[str, str])
+async def refresh_playlist():
+    """
+    Refresca la biblioteca de canciones disponibles (lista de reproducción) recargándola desde la playlist de YouTube.
+    """
+    global availableSongs
+    playlist_id = get_playlist_id_from_url(PLAYLIST_LINK)
+    if not playlist_id:
+        return {"error": "No se pudo extraer el playlistId de la URL"}
+    try:
+        loaded = fetch_playlist_items(playlist_id)
+        availableSongs = loaded
+        return {"message": f"Biblioteca refrescada con {len(availableSongs)} canciones."}
+    except Exception as e:
+        return {"error": f"Error refrescando la playlist: {e}"}
